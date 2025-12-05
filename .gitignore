@@ -1,0 +1,9 @@
+/vendor/
+/node_modules/
+/scan_tmp/
+/.idea/
+/.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+.env
