@@ -13,35 +13,43 @@ if (!defined('DEBUG_MODE')) {
 }
 
 /**
- * Start the session if not already started.
- */
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
-
-/**
  * Authenticate user via Bitrix or password form.
  *
  * @return void
  */
 function authenticateUser(): void
 {
-    if (defined('ACCESS_BITRIX') && ACCESS_BITRIX) {
-        require_once $_SERVER['DOCUMENT_ROOT'] . '/bitrix/modules/main/include/prolog_before.php';
+    $docRoot = realpath($_SERVER['DOCUMENT_ROOT']) ?: $_SERVER['DOCUMENT_ROOT'];
+    $bitrixPrologPath = $docRoot ? $docRoot . '/bitrix/modules/main/include/prolog_before.php' : '';
+    $useBitrix = (defined('ACCESS_BITRIX') && ACCESS_BITRIX === true && $bitrixPrologPath && file_exists($bitrixPrologPath));
+
+    if ($useBitrix) {
+        require_once $bitrixPrologPath;
         global $USER;
         if (!$USER || !$USER->IsAdmin()) {
             header('HTTP/1.1 403 Forbidden');
             echo 'Access denied';
             exit;
         }
+        if (session_status() === PHP_SESSION_NONE) {
+            session_start();
+        }
         return;
     }
 
-    if (empty($_SESSION['restore_authenticated'])) {
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+
+    if (empty($_SESSION['is_authenticated'])) {
         $error = '';
+        $passwordWarning = '';
+        if (ACCESS_PASSWORD === '123456') {
+            $passwordWarning = 'Default password is still set. Please change ACCESS_PASSWORD in restore.php.';
+        }
         if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
             if ($_POST['password'] === ACCESS_PASSWORD) {
-                $_SESSION['restore_authenticated'] = true;
+                $_SESSION['is_authenticated'] = true;
                 header('Location: ' . $_SERVER['PHP_SELF']);
                 exit;
             }
@@ -53,6 +61,9 @@ function authenticateUser(): void
         echo '<h1 class="mb-3">Restore Access</h1>';
         if ($error !== '') {
             echo '<div class="alert alert-danger">' . htmlspecialchars($error, ENT_QUOTES, 'UTF-8') . '</div>';
+        }
+        if ($passwordWarning !== '') {
+            echo '<div class="alert alert-warning">' . htmlspecialchars($passwordWarning, ENT_QUOTES, 'UTF-8') . '</div>';
         }
         echo '<form method="post" class="card card-body">';
         echo '<div class="mb-3"><label class="form-label">Password</label><input type="password" name="password" class="form-control" required></div>';

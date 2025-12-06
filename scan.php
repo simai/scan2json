@@ -104,6 +104,135 @@ function debugLog($msg) {
     }
 }
 
+/**
+ * Reset scan-related session state.
+ *
+ * @return void
+ */
+function resetScanState(): void
+{
+    $_SESSION['SCAN_TMPFILE']    = '';
+    $_SESSION['SCAN_FILECOUNT']  = 0;
+    $_SESSION['SCAN_OFFSET']     = 0;
+    $_SESSION['SCAN_JSONLFILE']  = '';
+    $_SESSION['SCAN_JSONFILE']   = '';
+    $_SESSION['SCAN_FOLDERNAME'] = '';
+}
+
+/**
+ * Decode custom selection JSON and return allowed top-level items.
+ *
+ * @param string $raw
+ * @return array<string>
+ */
+function parseCustomSelection(string $raw): array
+{
+    if ($raw === '') {
+        return [];
+    }
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded) || !isset($decoded['items']) || !is_array($decoded['items'])) {
+        return [];
+    }
+    $clean = [];
+    foreach ($decoded['items'] as $item) {
+        if (is_string($item) && $item !== '') {
+            $clean[] = $item;
+        }
+    }
+    return $clean;
+}
+
+/**
+ * Recursively clear files and subdirectories inside scan_tmp.
+ *
+ * @param string $dir
+ * @return array<string, int> Array with deleted and errors counters.
+ */
+function clearScanTmp(string $dir): array
+{
+    $deleted = 0;
+    $errors = 0;
+    if (!is_dir($dir)) {
+        return ['deleted' => 0, 'errors' => 0];
+    }
+    $items = @scandir($dir);
+    if (!is_array($items)) {
+        return ['deleted' => 0, 'errors' => 1];
+    }
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') {
+            continue;
+        }
+        $path = $dir . '/' . $item;
+        if (is_dir($path)) {
+            $result = clearScanTmp($path);
+            $deleted += $result['deleted'];
+            $errors += $result['errors'];
+            if (@rmdir($path)) {
+                $deleted++;
+            } else {
+                $errors++;
+            }
+        } else {
+            if (@unlink($path)) {
+                $deleted++;
+            } else {
+                $errors++;
+            }
+        }
+    }
+    return ['deleted' => $deleted, 'errors' => $errors];
+}
+
+/**
+ * Check if scan_tmp contains any files or folders.
+ *
+ * @param string $dir
+ * @return bool
+ */
+function scanTmpHasData(string $dir): bool
+{
+    if (!is_dir($dir)) {
+        return false;
+    }
+    $items = @scandir($dir);
+    if (!is_array($items)) {
+        return false;
+    }
+    foreach ($items as $item) {
+        if ($item !== '.' && $item !== '..') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Convert bytes to a short human-readable string (e.g., 950B, 1.2KB, 12MB).
+ *
+ * @param int $bytes
+ * @return string
+ */
+function formatSize(int $bytes): string
+{
+    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    $i = 0;
+    $size = $bytes;
+    while ($size >= 1024 && $i < count($units) - 1) {
+        $size /= 1024;
+        $i++;
+    }
+    if ($size >= 100) {
+        $sizeStr = (string) round($size);
+    } elseif ($size >= 10) {
+        $sizeStr = number_format($size, 1);
+    } else {
+        $sizeStr = number_format($size, 2);
+    }
+    return $sizeStr . $units[$i];
+}
+
 // -------------------------------------
 // 4. AJAX: handle one chunk (scanChunk)
 // -------------------------------------
@@ -196,6 +325,11 @@ if (
         $safeFolder = preg_replace('/[^a-zA-Z0-9_\-]+/u', '_', $folderName);
         $tokenMax = (int)constant('TOKEN_MAX');
         $zipFile = '';
+        $jsonlSize = '';
+        $jsonSize = '';
+        $jsonlZipSize = '';
+        $jsonZipSize = '';
+        $partsZipSize = '';
         $jsonFileCreated = false;
         $jsonlZipFile = '';
         $jsonZipFile = '';
@@ -291,7 +425,9 @@ if (
                     $zip->addFile($jsonlFilePath, basename($jsonlFilePath));
                     $zip->close();
                     $jsonlZipFile = basename($jsonlZipPath);
+                    $jsonlZipSize = file_exists($jsonlZipPath) ? formatSize((int) filesize($jsonlZipPath)) : '';
                 }
+                $jsonlSize = formatSize((int) filesize($jsonlFilePath));
             }
             // Zip single JSON (if created)
             if ($jsonFileCreated && file_exists($jsonFilePath)) {
@@ -303,6 +439,13 @@ if (
                     $zip->close();
                     $jsonZipFile = basename($jsonZipPath);
                 }
+                $jsonSize = formatSize((int) filesize($jsonFilePath));
+                if (file_exists($jsonZipPath ?? '')) {
+                    $jsonZipSize = formatSize((int) filesize($jsonZipPath));
+                }
+            }
+            if (file_exists($zipFile)) {
+                $partsZipSize = formatSize((int) filesize($zipFile));
             }
         }
 
@@ -318,6 +461,11 @@ if (
             'zip_file'  => $zipFile ? basename($zipFile) : '',
             'jsonl_zip' => $jsonlZipFile,
             'json_zip'  => $jsonZipFile,
+            'jsonl_size'=> $jsonlSize,
+            'json_size' => $jsonSize,
+            'jsonl_zip_size' => $jsonlZipSize,
+            'json_zip_size' => $jsonZipSize,
+            'zip_size'  => $partsZipSize,
             'token_count' => $tokenCount
         ]);
         $_SESSION['SCAN_OFFSET'] = $newOffset;
@@ -400,7 +548,17 @@ function shouldProcessPath($fullPath, &$visitedInodes) {
     return true;
 }
 
-function collectFilePathsToFile($dir, $fp, &$visitedInodes) {
+/**
+ * Collect file paths recursively into the temp list.
+ *
+ * @param string $dir
+ * @param resource $fp
+ * @param array<int, bool> $visitedInodes
+ * @param array<string> $allowedRootItems
+ * @param int $depth
+ * @return void
+ */
+function collectFilePathsToFile($dir, $fp, &$visitedInodes, array $allowedRootItems, $depth = 0) {
     global $excludePrefixes, $excludeFiles, $excludeDirs;
     
     // Get all items in the folder
@@ -417,6 +575,10 @@ function collectFilePathsToFile($dir, $fp, &$visitedInodes) {
 
     foreach ($items as $item) {
         if ($item === '.' || $item === '..') continue;
+
+        if ($depth === 0 && !empty($allowedRootItems) && !in_array($item, $allowedRootItems, true)) {
+            continue;
+        }
 
         // Skip folders with the configured prefixes
         foreach ($excludePrefixes as $pref) {
@@ -441,7 +603,7 @@ function collectFilePathsToFile($dir, $fp, &$visitedInodes) {
                 continue;
             }
             // Recursively handle nested folders
-            collectFilePathsToFile($full, $fp, $visitedInodes);
+            collectFilePathsToFile($full, $fp, $visitedInodes, $allowedRootItems, $depth + 1);
         } elseif (is_file($full)) {
             // If this is a file, write its path
             if (in_array($item, $excludeFiles)) {
@@ -465,15 +627,39 @@ function collectFilePathsToFile($dir, $fp, &$visitedInodes) {
 $method                 = $_POST['folder_select_method'] ?? 'manual'; 
 $currentFolderDropdown  = $_SESSION['CUR_FOLDER'] ?? '';
 $docRoot                = realpath($_SERVER['DOCUMENT_ROOT']);
+$scanTmpDir             = $docRoot . '/scan_tmp';
+$hasGeneratedData       = scanTmpHasData($scanTmpDir);
+$manualPathInput        = ltrim((string)($_POST['scan_folder'] ?? ''), '/');
+$customSelectionRaw     = $_POST['custom_selection'] ?? '';
+$allowedRootItems       = parseCustomSelection($customSelectionRaw);
+$selectionError         = '';
+$currentSubdirs         = [];
+$currentFiles           = [];
+$openSelection          = isset($_POST['open_selection']) && $_POST['open_selection'] === '1';
+$clearMessage           = '';
 
 // Reset
 if (isset($_POST['reset'])) {
-    $_SESSION['SCAN_TMPFILE']   = '';
-    $_SESSION['SCAN_FILECOUNT'] = 0;
-    $_SESSION['SCAN_OFFSET']    = 0;
-    $_SESSION['CUR_FOLDER']     = '';
-    $_SESSION['SCAN_FOLDERNAME'] = '';
-    $currentFolderDropdown      = '';
+    resetScanState();
+    $_SESSION['CUR_FOLDER']      = '';
+    $currentFolderDropdown       = '';
+    $customSelectionRaw         = '';
+    $allowedRootItems           = [];
+    $selectionError             = '';
+    $hasGeneratedData           = scanTmpHasData($scanTmpDir);
+}
+
+// Clear generated data in scan_tmp
+if (isset($_POST['clear_generated'])) {
+    $res = clearScanTmp($scanTmpDir);
+    resetScanState();
+    $_SESSION['CUR_FOLDER']      = '';
+    $currentFolderDropdown       = '';
+    $customSelectionRaw         = '';
+    $allowedRootItems           = [];
+    $selectionError             = '';
+    $clearMessage = "Deleted {$res['deleted']} item(s) from scan_tmp" . ($res['errors'] ? " with {$res['errors']} error(s)" : '');
+    $hasGeneratedData = scanTmpHasData($scanTmpDir);
 }
 
 // Expand subfolders
@@ -482,6 +668,7 @@ if (
     && isset($_POST['expandDropdown'])
     && !isset($_POST['collect_and_scan'])
 ) {
+    resetScanState();
     $sel   = trim($_POST['selected_subfolder'] ?? '', '/');
     if ($sel !== '') {
         $tryRel  = $currentFolderDropdown 
@@ -532,6 +719,8 @@ if (isset($_POST['collect_and_scan'])) {
 
     if (!$fullPathToScan) {
         $scanMessage = "Folder not found or outside of DOCUMENT_ROOT.";
+    } elseif ($customSelectionRaw !== '' && empty($allowedRootItems)) {
+        $scanMessage = "Please select at least one item to scan.";
     } else {
         $tmpDir = $docRoot . '/scan_tmp'; 
         if (!is_dir($tmpDir)) {
@@ -548,7 +737,7 @@ if (isset($_POST['collect_and_scan'])) {
             $scanMessage = "Failed to create temporary file: $tmpFilePath";
         } else {
             $visited = [];
-            collectFilePathsToFile($fullPathToScan, $fp, $visited);
+            collectFilePathsToFile($fullPathToScan, $fp, $visited, $allowedRootItems, 0);
             fclose($fp);
 
             // Count lines
@@ -575,10 +764,33 @@ if (isset($_POST['collect_and_scan'])) {
 // Handle the "Level up" button
 if (isset($_POST['goUp']) && $currentFolderDropdown) {
     // Split current path by "/"
+    resetScanState();
     $parentFolder = dirname($currentFolderDropdown);
     $_SESSION['CUR_FOLDER'] = $parentFolder === '/' ? '' : $parentFolder;
     $currentFolderDropdown = $_SESSION['CUR_FOLDER'];  // Update current folder
 }
+
+// Build lists for current folder (subdirs and files)
+$listingTarget = $method === 'manual' ? $manualPathInput : $currentFolderDropdown;
+$listingPath = $docRoot . '/' . trim($listingTarget, '/');
+if (is_dir($listingPath)) {
+    $items = @scandir($listingPath);
+    if (is_array($items)) {
+        foreach ($items as $itm) {
+            if ($itm === '.' || $itm === '..') {
+                continue;
+            }
+            $full = $listingPath . '/' . $itm;
+            if (is_dir($full)) {
+                $currentSubdirs[] = $itm;
+            } elseif (is_file($full)) {
+                $currentFiles[] = $itm;
+            }
+        }
+    }
+}
+sort($currentSubdirs);
+sort($currentFiles);
 
 ?>
 <!DOCTYPE html>
@@ -600,6 +812,7 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
 
     <!-- Form -->
     <form method="post" action="" class="mb-4" id="scanForm">
+        <input type="hidden" name="custom_selection" id="custom_selection" value="<?=htmlspecialchars($customSelectionRaw, ENT_QUOTES, 'UTF-8')?>">
         <div class="mb-3">
             <label class="form-label fw-bold">How to select the folder:</label>
 
@@ -621,14 +834,17 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
                 <label for="scan_folder" class="form-label">
                     Examples: "/", "/local", "/catalog/images"
                 </label>
-                <input 
-                    type="text" 
-                    name="scan_folder" 
-                    id="scan_folder" 
-                    class="form-control" 
-                    value="<?=htmlspecialchars($_POST['scan_folder'] ?? '')?>"
-                    placeholder="Example: /local"
-                >
+                <div class="d-flex align-items-center gap-2">
+                    <input 
+                        type="text" 
+                        name="scan_folder" 
+                        id="scan_folder" 
+                        class="form-control" 
+                        value="<?=htmlspecialchars($_POST['scan_folder'] ?? '')?>"
+                        placeholder="Example: /local"
+                    >
+                    <button type="button" class="btn btn-secondary choose-items-btn text-nowrap">Choose items…</button>
+                </div>
             </div>
         </div>
 
@@ -648,74 +864,116 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
             </div>
 
             <div class="mt-2" id="dropdownBlock" style="display:none;">
-                <div>
-                <?php
-                $docRoot = realpath($_SERVER['DOCUMENT_ROOT']);
-                if (!$currentFolderDropdown) {
-                    echo '<div class="alert alert-secondary p-2 mb-3">
-                            <strong>Current folder:</strong> Site root
-                        </div>';
-                } else {
-                    echo '<div class="alert alert-secondary p-2 mb-3">
-                            <strong>Current folder:</strong> /' . htmlspecialchars($currentFolderDropdown) . '
-                        </div>';
-                }
-                // Button to go one level up
-                if ($currentFolderDropdown) {
-                    echo '<button type="submit" name="goUp" class="btn btn-secondary d-block mb-3">Go up one level</button>';
-                }
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <div class="alert alert-secondary p-2 mb-0 flex-grow-1">
+                        <strong>Current folder:</strong>
+                        <?php if (!$currentFolderDropdown): ?>
+                            Site root
+                        <?php else: ?>
+                            /<?=htmlspecialchars($currentFolderDropdown)?>
+                        <?php endif; ?>
+                    </div>
+                    <button type="button" class="btn btn-secondary choose-items-btn">Choose items…</button>
+                </div>
 
-                // List of subfolders
-                $subfolders = [];
-                $fullDrop = $docRoot . '/' . trim($currentFolderDropdown, '/');
-                if (is_dir($fullDrop)) {
-                    $items = @scandir($fullDrop);
-                    if (is_array($items)) {
-                        foreach ($items as $d) {
-                            if ($d === '.' || $d === '..') continue;
-                            $td = $fullDrop . '/' . $d;
-                            if (is_dir($td)) {
-                                $subfolders[] = $d;
-                            }
-                        }
-                    }
-                }
-                sort($subfolders);
-
-                if (!empty($subfolders)) {
-                    ?>
-                    <!-- Automatic submit -->
-                    <input type="hidden" name="expandDropdown" value="1">
-                    <select name="selected_subfolder"
-                            class="form-select w-auto d-inline-block"
-                            onchange="this.form.submit();">
-                        <option value="">-- Select a subfolder --</option>
-                        <?php foreach ($subfolders as $sf): ?>
-                            <option value="<?=htmlspecialchars($sf)?>"><?=$sf?></option>
-                        <?php endforeach; ?>
-                    </select>
+                <div class="d-flex align-items-center gap-2 mb-3">
                     <?php
-                } else {
-                    echo '<div class="text-muted">No subfolders.</div>';
-                }
-                ?>
+                    $subfolders = $currentSubdirs;
+                    if (!empty($subfolders)) {
+                        ?>
+                        <!-- Automatic submit -->
+                        <input type="hidden" name="expandDropdown" value="1">
+                        <select name="selected_subfolder"
+                                class="form-select w-auto"
+                                onchange="this.form.submit();">
+                            <option value="">-- Select a subfolder --</option>
+                            <?php foreach ($subfolders as $sf): ?>
+                                <option value="<?=htmlspecialchars($sf)?>"><?=$sf?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <?php
+                    }
+                    ?>
+                    <?php if ($currentFolderDropdown): ?>
+                        <button type="submit" name="goUp" class="btn btn-outline-secondary">Go up one level</button>
+                        <button type="submit" name="reset" class="btn btn-outline-danger">Reset path</button>
+                    <?php endif; ?>
+                </div>
             </div>
         </div>
 
-        <div class="mt-4 mb-4">
-            <button type="submit" name="collect_and_scan" class="btn btn-primary me-2">
+        <div id="selectionPanel" class="bg-white border rounded p-3 mb-3" style="display:none;">
+            <h6 class="mb-1">Select folders and files to include in the scan</h6>
+            <p class="text-muted small mb-3">All items are selected by default. Uncheck those you want to exclude.</p>
+            <div class="row g-2 mb-3">
+                <?php
+                $hadEntries = false;
+                if (!empty($currentSubdirs)) {
+                    $hadEntries = true;
+                    foreach ($currentSubdirs as $dir) {
+                        $checked = (empty($allowedRootItems) || in_array($dir, $allowedRootItems, true)) ? 'checked' : '';
+                        ?>
+                        <div class="col-6">
+                            <label class="form-check">
+                                <input class="form-check-input cs-entry" type="checkbox" data-name="<?=htmlspecialchars($dir, ENT_QUOTES, 'UTF-8')?>" <?=$checked?>>
+                                <span class="form-check-label">[dir] <?=$dir?></span>
+                            </label>
+                        </div>
+                        <?php
+                    }
+                }
+                if (!empty($currentFiles)) {
+                    $hadEntries = true;
+                    foreach ($currentFiles as $file) {
+                        $checked = (empty($allowedRootItems) || in_array($file, $allowedRootItems, true)) ? 'checked' : '';
+                        ?>
+                        <div class="col-6">
+                            <label class="form-check">
+                                <input class="form-check-input cs-entry" type="checkbox" data-name="<?=htmlspecialchars($file, ENT_QUOTES, 'UTF-8')?>" <?=$checked?>>
+                                <span class="form-check-label">[file] <?=$file?></span>
+                            </label>
+                        </div>
+                        <?php
+                    }
+                }
+                if (!$hadEntries) {
+                    echo '<div class="col-12 text-muted">No items found in this folder.</div>';
+                }
+                ?>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+                <button type="button" class="btn btn-primary btn-sm" id="applySelection">Apply selection</button>
+                <button type="button" class="btn btn-secondary btn-sm" id="cancelSelection">Cancel</button>
+                <span class="text-danger small" id="selectionError" style="display:none;">Please select at least one item to scan.</span>
+            </div>
+        </div>
+
+        <div class="mt-4 mb-2">
+            <input type="hidden" name="open_selection" id="open_selection" value="<?=$openSelection ? '1' : ''?>">
+            <button type="submit" name="collect_and_scan" class="btn btn-primary me-2" id="scanBtn">
                 Generate and scan
             </button>
-            <button type="submit" name="reset" class="btn btn-outline-danger">
-                Reset
+            <button type="button" class="btn btn-outline-danger me-2" id="stopScanBtn" style="display:none;">
+                Stop scan
             </button>
+            <?php if ($hasGeneratedData): ?>
+                <button type="submit" name="clear_generated" class="btn btn-outline-danger">
+                    Delete data
+                </button>
+            <?php endif; ?>
         </div>
+        <div id="inlineProgress" style="display:none;"></div>
     </form>
 
     <!-- Message output -->
     <?php if ($scanMessage !== ''): ?>
         <div class="alert alert-info">
             <?=htmlspecialchars($scanMessage)?>
+        </div>
+    <?php endif; ?>
+    <?php if ($clearMessage !== ''): ?>
+        <div class="alert alert-warning">
+            <?=htmlspecialchars($clearMessage)?>
         </div>
     <?php endif; ?>
 
@@ -733,6 +991,9 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
     if ($tmpFile && file_exists($tmpFile) && $total > 0):
     ?>
         <div id="scanProgress" class="alert alert-warning">
+            <div class="progress mb-2" style="height: 8px;">
+                <div id="progressBar" class="progress-bar" role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+            </div>
             Automatic scanning in progress...<br>
             Processed: <span id="processedCount">0</span> of <?=$total?>
         </div>
@@ -743,23 +1004,28 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
                 <div id="downloadJsonlRow" class="mt-2" style="display:none;">
                     <strong>JSONL:</strong>
                     <a id="downloadLink" href="" download="<?=htmlspecialchars($downloadFileName)?>">Download file</a>
+                    <small class="text-muted" id="jsonlSize" style="display:none;"></small>
                     <span id="downloadJsonlZipWrap" style="display:none;">
                         &nbsp;|&nbsp;
                         <a id="downloadJsonlZip" href="" download="">Download zip</a>
+                        <small class="text-muted" id="jsonlZipSize" style="display:none;"></small>
                     </span>
                 </div>
                 <div id="downloadJsonRow" class="mt-2" style="display:none;">
                     <strong>JSON:</strong>
                     <a id="downloadJsonLink" href="" download="<?=htmlspecialchars($downloadJsonFileName)?>">Download file</a>
+                    <small class="text-muted" id="jsonSize" style="display:none;"></small>
                     <span id="downloadJsonZipWrap" style="display:none;">
                         &nbsp;|&nbsp;
                         <a id="downloadJsonZip" href="" download="">Download zip</a>
+                        <small class="text-muted" id="jsonZipSize" style="display:none;"></small>
                     </span>
                 </div>
                 <div id="downloadJsonPartsRow" class="mt-2" style="display:none;">
                     <strong>JSON (parts):</strong>
                     <span id="downloadPartsZipWrap" style="display:none;">
                         <a id="downloadZipLink" href="" download="">Download archive (ZIP)</a>
+                        <small class="text-muted" id="partsZipSize" style="display:none;"></small>
                     </span>
                 </div>
                 <div id="tokenCountBlock" class="mt-2"></div>
@@ -778,6 +1044,26 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
         let downloadJsonlRow = document.getElementById('downloadJsonlRow');
         let downloadJsonRow = document.getElementById('downloadJsonRow');
         let downloadJsonPartsRow = document.getElementById('downloadJsonPartsRow');
+        let stopBtn = document.getElementById('stopScanBtn');
+        let scanBtn = document.getElementById('scanBtn');
+        let inlineProgress = document.getElementById('inlineProgress');
+        let inlineProgressBar = document.getElementById('inlineProgressBar');
+        let progressBar = document.getElementById('progressBar');
+        let jsonlSizeEl = document.getElementById('jsonlSize');
+        let jsonlZipSizeEl = document.getElementById('jsonlZipSize');
+        let jsonSizeEl = document.getElementById('jsonSize');
+        let jsonZipSizeEl = document.getElementById('jsonZipSize');
+        let partsZipSizeEl = document.getElementById('partsZipSize');
+        if (scanBtn) {
+            scanBtn.disabled = true;
+            scanBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Scanning...';
+        }
+        if (inlineProgress && inlineProgressBar) {
+            inlineProgress.style.display = '';
+            inlineProgressBar.style.width = '0%';
+            inlineProgressBar.classList.remove('bg-success');
+            inlineProgressBar.setAttribute('aria-valuenow', '0');
+        }
         function scanNextChunk() {
             if (!isScanning) return;
             let xhr = new XMLHttpRequest();
@@ -793,12 +1079,22 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
                             sp.classList.add('alert-danger');
                             sp.textContent = resp.message; 
                             isScanning = false;
+                            if (scanBtn) {
+                                scanBtn.disabled = false;
+                                scanBtn.textContent = 'Generate and scan';
+                            }
                         } 
                         else if (resp.status === 'done') {
                             sp.classList.remove('alert-warning', 'alert-danger');
                             sp.classList.add('alert-success');
                             sp.textContent = 'All files processed!';
                             isScanning = false;
+                            if (scanBtn) {
+                                scanBtn.disabled = false;
+                                scanBtn.textContent = 'Generate and scan';
+                            }
+                            if (inlineProgress) inlineProgress.style.display = 'none';
+                            if (stopBtn) stopBtn.style.display = 'none';
                             // Show download link and token info
                             if (resp.jsonl_file) {
                                 let block = document.getElementById('downloadBlock');
@@ -807,12 +1103,20 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
                                 link.href = '/scan_tmp/' + resp.jsonl_file;
                                 link.setAttribute('download', resp.jsonl_file || downloadFileName);
                                 downloadJsonlRow.style.display = '';
+                                if (jsonlSizeEl && resp.jsonl_size) {
+                                    jsonlSizeEl.textContent = ' (' + resp.jsonl_size + ')';
+                                    jsonlSizeEl.style.display = '';
+                                }
                                 if (resp.jsonl_zip) {
                                     let zipWrap = document.getElementById('downloadJsonlZipWrap');
                                     let zipLink = document.getElementById('downloadJsonlZip');
                                     zipLink.href = '/scan_tmp/' + resp.jsonl_zip;
                                     zipLink.setAttribute('download', resp.jsonl_zip || '');
                                     zipWrap.style.display = '';
+                                    if (jsonlZipSizeEl && resp.jsonl_zip_size) {
+                                        jsonlZipSizeEl.textContent = ' (' + resp.jsonl_zip_size + ')';
+                                        jsonlZipSizeEl.style.display = '';
+                                    }
                                 }
                                 // JSON row
                                 if (resp.json_file) {
@@ -821,12 +1125,20 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
                                     jsonLink.href = '/scan_tmp/' + resp.json_file;
                                     jsonLink.setAttribute('download', resp.json_file || downloadJsonFileName);
                                     jsonRow.style.display = '';
+                                    if (jsonSizeEl && resp.json_size) {
+                                        jsonSizeEl.textContent = ' (' + resp.json_size + ')';
+                                        jsonSizeEl.style.display = '';
+                                    }
                                     if (resp.json_zip) {
                                         let jsonZipWrap = document.getElementById('downloadJsonZipWrap');
                                         let jsonZipLink = document.getElementById('downloadJsonZip');
                                         jsonZipLink.href = '/scan_tmp/' + resp.json_zip;
                                         jsonZipLink.setAttribute('download', resp.json_zip || '');
                                         jsonZipWrap.style.display = '';
+                                        if (jsonZipSizeEl && resp.json_zip_size) {
+                                            jsonZipSizeEl.textContent = ' (' + resp.json_zip_size + ')';
+                                            jsonZipSizeEl.style.display = '';
+                                        }
                                     }
                                 }
                                 // JSON parts row (zip only)
@@ -838,6 +1150,10 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
                                     zipLink.setAttribute('download', resp.zip_file || '');
                                     partsZipWrap.style.display = '';
                                     partsRow.style.display = '';
+                                    if (partsZipSizeEl && resp.zip_size) {
+                                        partsZipSizeEl.textContent = ' (' + resp.zip_size + ')';
+                                        partsZipSizeEl.style.display = '';
+                                    }
                                 }
                                 block.style.display = '';
                                 if (resp.token_count !== undefined) {
@@ -852,6 +1168,20 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
                             pCount += resp.processed;
                             processedSpan.innerText = pCount;
 
+                            if (progressBar && totalFiles > 0) {
+                                let percent = Math.min(100, Math.round((pCount / totalFiles) * 100));
+                                progressBar.style.width = percent + '%';
+                                progressBar.setAttribute('aria-valuenow', String(percent));
+                            }
+                            if (inlineProgressBar && totalFiles > 0) {
+                                let percent = Math.min(100, Math.round((pCount / totalFiles) * 100));
+                                inlineProgressBar.style.width = percent + '%';
+                                inlineProgressBar.setAttribute('aria-valuenow', String(percent));
+                                if (percent === 100) {
+                                    inlineProgressBar.classList.add('bg-success');
+                                }
+                            }
+
                             if (pCount < totalFiles) {
                                 scanNextChunk();
                             } else {
@@ -859,6 +1189,12 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
                                 sp.classList.add('alert-success');
                                 sp.textContent = 'All files processed!';
                                 isScanning = false;
+                                if (inlineProgress) inlineProgress.style.display = 'none';
+                                if (scanBtn) {
+                                    scanBtn.disabled = false;
+                                    scanBtn.textContent = 'Generate and scan';
+                                }
+                                if (stopBtn) stopBtn.style.display = 'none';
                                 // Show download link
                                 if (resp.jsonl_file) {
                                     let block = document.getElementById('downloadBlock');
@@ -905,14 +1241,41 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
                         }
                     } catch (e) {
                         let sp = document.getElementById('scanProgress');
-                        sp.classList.remove('alert-warning', 'alert-success');
-                        sp.classList.add('alert-danger');
-                        sp.textContent = 'Response parse error: ' + e;
+                        if (sp) {
+                            sp.classList.remove('alert-warning', 'alert-success');
+                            sp.classList.add('alert-danger');
+                            sp.textContent = 'Response parse error: ' + e;
+                        }
                         isScanning = false;
+                        if (scanBtn) {
+                            scanBtn.disabled = false;
+                            scanBtn.textContent = 'Generate and scan';
+                        }
+                        if (stopBtn) stopBtn.style.display = 'none';
+                        if (inlineProgress) inlineProgress.style.display = 'none';
                     }
                 }
             };
             xhr.send();
+        }
+
+        if (stopBtn) {
+            stopBtn.style.display = '';
+            stopBtn.addEventListener('click', function() {
+                isScanning = false;
+                stopBtn.style.display = 'none';
+                if (scanBtn) {
+                    scanBtn.disabled = false;
+                    scanBtn.textContent = 'Generate and scan';
+                }
+                if (inlineProgress) inlineProgress.style.display = 'none';
+                let sp = document.getElementById('scanProgress');
+                if (sp) {
+                    sp.classList.remove('alert-warning');
+                    sp.classList.add('alert-info');
+                    sp.textContent = 'Scanning stopped by user.';
+                }
+            });
         }
 
         // Run the first request
@@ -937,6 +1300,14 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
     let radDrop = document.getElementById('radioDropdown');
     let manBlock = document.getElementById('manualBlock');
     let dropBlock = document.getElementById('dropdownBlock');
+    let chooseBtns = Array.from(document.querySelectorAll('.choose-items-btn'));
+    let selectionPanel = document.getElementById('selectionPanel');
+    let applySelection = document.getElementById('applySelection');
+    let cancelSelection = document.getElementById('cancelSelection');
+    let selectionError = document.getElementById('selectionError');
+    let customSelectionInput = document.getElementById('custom_selection');
+    let openSelectionInput = document.getElementById('open_selection');
+    let openSelectionOnLoad = <?= $openSelection ? 'true' : 'false' ?>;
 
     function toggleMeth() {
         if (radMan.checked) {
@@ -951,6 +1322,49 @@ if (isset($_POST['goUp']) && $currentFolderDropdown) {
     radMan.addEventListener('change', toggleMeth);
     radDrop.addEventListener('change', toggleMeth);
     toggleMeth();
+
+    if (chooseBtns.length && selectionPanel) {
+        chooseBtns.forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                if (radMan.checked) {
+                    if (openSelectionInput) openSelectionInput.value = '1';
+                    document.getElementById('scanForm').submit();
+                } else {
+                    selectionPanel.style.display = 'block';
+                    if (selectionError) selectionError.style.display = 'none';
+                }
+            });
+        });
+    }
+
+    if (applySelection && selectionPanel) {
+        applySelection.addEventListener('click', function() {
+            let boxes = Array.from(document.querySelectorAll('.cs-entry'));
+            let selected = boxes.filter(function(el){ return el.checked; }).map(function(el){ return el.getAttribute('data-name'); });
+            if (selected.length === 0) {
+                if (selectionError) selectionError.style.display = 'inline';
+                return;
+            }
+            if (selectionError) selectionError.style.display = 'none';
+            if (customSelectionInput) {
+                customSelectionInput.value = JSON.stringify({items: selected});
+            }
+            selectionPanel.style.display = 'none';
+        });
+    }
+
+    if (cancelSelection && selectionPanel) {
+        cancelSelection.addEventListener('click', function() {
+            if (selectionError) selectionError.style.display = 'none';
+            selectionPanel.style.display = 'none';
+        });
+    }
+
+    if (openSelectionOnLoad && selectionPanel) {
+        selectionPanel.style.display = 'block';
+        if (selectionError) selectionError.style.display = 'none';
+        if (openSelectionInput) openSelectionInput.value = '';
+    }
 })();
 </script>
 
