@@ -57,6 +57,7 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
+// Holds warning text for password mode (not used when default password is blocked)
 $passwordWarning = '';
 
 // -------------------------------------
@@ -64,27 +65,20 @@ $passwordWarning = '';
 // -------------------------------------
 if (!$useBitrix) {
     if (ACCESS_PASSWORD === '123456') {
-        $passwordWarning = 'Default password is still set. Please change ACCESS_PASSWORD in scan.php.';
+        renderDefaultPasswordWarning();
     }
-    if (empty($_SESSION['is_authenticated'])) {
-        if ($_SERVER['REQUEST_METHOD']==='POST' && ($_POST['password'] ?? '')===ACCESS_PASSWORD) {
-            $_SESSION['is_authenticated']=true;
-            header("Location: ".$_SERVER['PHP_SELF']);
-            exit;
+    if (empty($_SESSION['scan2json_authenticated']) || $_SESSION['scan2json_authenticated'] !== true) {
+        $errorMessage = null;
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $password = $_POST['access_password'] ?? '';
+            if ($password === ACCESS_PASSWORD) {
+                $_SESSION['scan2json_authenticated'] = true;
+                header('Location: ' . $_SERVER['PHP_SELF']);
+                exit;
+            }
+            $errorMessage = 'Invalid password.';
         }
-        // Login form
-        echo '<h2>Enter password:</h2>';
-        if ($passwordWarning !== '') {
-            echo '<p style="color:orange;">' . htmlspecialchars($passwordWarning, ENT_QUOTES, 'UTF-8') . '</p>';
-        }
-        if (!empty($_POST)) {
-            echo '<p style="color:red;">Incorrect password</p>';
-        }
-        echo '<form method="post">
-                <input type="password" name="password" required>
-                <button>Log in</button>
-             </form>';
-        exit;
+        renderPasswordForm($errorMessage);
     }
 }
 
@@ -102,6 +96,103 @@ function debugLog($msg) {
     if (DEBUG_MODE) {
         $GLOBALS['DEBUG_LOG'][] = $msg;
     }
+}
+
+/**
+ * Renders a Bootstrap-based password login page and exits.
+ *
+ * @param string|null $errorMessage Optional error message to display above the form.
+ * @return void
+ */
+function renderPasswordForm(?string $errorMessage = null): void
+{
+    ?>
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Access required</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+    <div class="container py-5">
+        <div class="row justify-content-center">
+            <div class="col-md-4">
+                <div class="card shadow-sm">
+                    <div class="card-body">
+                        <h1 class="h4 mb-3 text-center">Enter password</h1>
+                        <?php if ($errorMessage !== null): ?>
+                            <div class="alert alert-danger py-2 mb-3">
+                                <?=htmlspecialchars($errorMessage, ENT_QUOTES, 'UTF-8')?>
+                            </div>
+                        <?php endif; ?>
+                        <form method="post">
+                            <div class="mb-3">
+                                <label for="access_password" class="form-label">Password</label>
+                                <input
+                                    type="password"
+                                    name="access_password"
+                                    id="access_password"
+                                    class="form-control"
+                                    autocomplete="current-password"
+                                    required
+                                >
+                            </div>
+                            <button type="submit" class="btn btn-primary w-100">Log in</button>
+                        </form>
+                    </div>
+                </div>
+                <p class="text-muted small mt-3 text-center">
+                    Tip: change the ACCESS_PASSWORD constant in the script before using it on a real server.
+                </p>
+            </div>
+        </div>
+    </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+
+/**
+ * Renders a blocking notice when the default password is still in use.
+ *
+ * @return void
+ */
+function renderDefaultPasswordWarning(): void
+{
+    ?>
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Access blocked</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+    <div class="container py-5">
+        <div class="row justify-content-center">
+            <div class="col-md-5">
+                <div class="card shadow-sm border-danger">
+                    <div class="card-body">
+                        <h1 class="h4 mb-3 text-center text-danger">Access blocked</h1>
+                        <div class="alert alert-warning mb-0">
+                            Please change the ACCESS_PASSWORD constant from the default value before using this tool.
+                        </div>
+                    </div>
+                </div>
+                <p class="text-muted small mt-3 text-center">
+                    Update ACCESS_PASSWORD in scan.php and reload the page.
+                </p>
+            </div>
+        </div>
+    </div>
+    </body>
+    </html>
+    <?php
+    exit;
 }
 
 /**

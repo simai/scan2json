@@ -13,6 +13,103 @@ if (!defined('DEBUG_MODE')) {
 }
 
 /**
+ * Renders a Bootstrap-based password login page and exits.
+ *
+ * @param string|null $errorMessage Optional error message to display above the form.
+ * @return void
+ */
+function renderPasswordForm(?string $errorMessage = null): void
+{
+    ?>
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Access required</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+    <div class="container py-5">
+        <div class="row justify-content-center">
+            <div class="col-md-4">
+                <div class="card shadow-sm">
+                    <div class="card-body">
+                        <h1 class="h4 mb-3 text-center">Enter password</h1>
+                        <?php if ($errorMessage !== null): ?>
+                            <div class="alert alert-danger py-2 mb-3">
+                                <?=htmlspecialchars($errorMessage, ENT_QUOTES, 'UTF-8')?>
+                            </div>
+                        <?php endif; ?>
+                        <form method="post">
+                            <div class="mb-3">
+                                <label for="access_password" class="form-label">Password</label>
+                                <input
+                                    type="password"
+                                    name="access_password"
+                                    id="access_password"
+                                    class="form-control"
+                                    autocomplete="current-password"
+                                    required
+                                >
+                            </div>
+                            <button type="submit" class="btn btn-primary w-100">Log in</button>
+                        </form>
+                    </div>
+                </div>
+                <p class="text-muted small mt-3 text-center">
+                    Tip: change the ACCESS_PASSWORD constant in the script before using it on a real server.
+                </p>
+            </div>
+        </div>
+    </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+
+/**
+ * Renders a blocking notice when the default password is still in use.
+ *
+ * @return void
+ */
+function renderDefaultPasswordWarning(): void
+{
+    ?>
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Access blocked</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+    <div class="container py-5">
+        <div class="row justify-content-center">
+            <div class="col-md-5">
+                <div class="card shadow-sm border-danger">
+                    <div class="card-body">
+                        <h1 class="h4 mb-3 text-center text-danger">Access blocked</h1>
+                        <div class="alert alert-warning mb-0">
+                            Please change the ACCESS_PASSWORD constant from the default value before using this tool.
+                        </div>
+                    </div>
+                </div>
+                <p class="text-muted small mt-3 text-center">
+                    Update ACCESS_PASSWORD in restore.php and reload the page.
+                </p>
+            </div>
+        </div>
+    </div>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+
+/**
  * Authenticate user via Bitrix or password form.
  *
  * @return void
@@ -41,35 +138,22 @@ function authenticateUser(): void
         session_start();
     }
 
-    if (empty($_SESSION['is_authenticated'])) {
-        $error = '';
-        $passwordWarning = '';
-        if (ACCESS_PASSWORD === '123456') {
-            $passwordWarning = 'Default password is still set. Please change ACCESS_PASSWORD in restore.php.';
-        }
-        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['password'])) {
-            if ($_POST['password'] === ACCESS_PASSWORD) {
-                $_SESSION['is_authenticated'] = true;
+    if (ACCESS_PASSWORD === '123456') {
+        renderDefaultPasswordWarning();
+    }
+
+    if (empty($_SESSION['scan2json_authenticated']) || $_SESSION['scan2json_authenticated'] !== true) {
+        $errorMessage = null;
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $password = $_POST['access_password'] ?? '';
+            if ($password === ACCESS_PASSWORD) {
+                $_SESSION['scan2json_authenticated'] = true;
                 header('Location: ' . $_SERVER['PHP_SELF']);
                 exit;
             }
-            $error = 'Incorrect password';
-            header('HTTP/1.1 403 Forbidden');
+            $errorMessage = 'Invalid password.';
         }
-        echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Restore Access</title>';
-        echo '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head><body class="bg-light"><div class="container py-4">';
-        echo '<h1 class="mb-3">Restore Access</h1>';
-        if ($error !== '') {
-            echo '<div class="alert alert-danger">' . htmlspecialchars($error, ENT_QUOTES, 'UTF-8') . '</div>';
-        }
-        if ($passwordWarning !== '') {
-            echo '<div class="alert alert-warning">' . htmlspecialchars($passwordWarning, ENT_QUOTES, 'UTF-8') . '</div>';
-        }
-        echo '<form method="post" class="card card-body">';
-        echo '<div class="mb-3"><label class="form-label">Password</label><input type="password" name="password" class="form-control" required></div>';
-        echo '<button class="btn btn-primary">Log in</button>';
-        echo '</form></div></body></html>';
-        exit;
+        renderPasswordForm($errorMessage);
     }
 }
 
